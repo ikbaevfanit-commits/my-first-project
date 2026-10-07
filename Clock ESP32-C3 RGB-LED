@@ -1,0 +1,267 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <time.h>
+
+#include <Adafruit_NeoPixel.h>
+
+// Аппаратная конфигурация
+#define LED_PIN         10   // Контакт управления лентой часов
+#define INTERNAL_LED     8   // Встроенный синий светодиод на плате ESP32-C3 Super Mini
+#define NUM_LEDS        60   // Лента из 60 светодиодов
+
+// Геометрический сдвиг: 00:00:00 строго на 28-м светодиоде ленты
+#define LED_OFFSET      28
+
+// Точка доступа для первой настройки Wi-Fi
+const char* AP_NAME = "Clock-Setup";
+const char* AP_PASS = "clock1234";   // минимум 8 символов
+
+// Настройки часового пояса (Уфа: UTC +5 часов, без перехода на летнее время)
+const long  gmtOffset_sec = 5 * 3600;
+const int   daylightOffset_sec = 0;
+
+// Инициализация объекта адресной ленты
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Хранилище настроек в энергонезависимой памяти
+Preferences prefs;
+WebServer server(80);
+
+bool portalMode = false;
+bool hasSavedCreds = false;
+unsigned long portalStart = 0;
+String scanOptions;
+
+// Экранирование текста для вставки в HTML
+String htmlEscape(const String& s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
+// Страница с формой ввода имени сети и пароля
+void handleRoot() {
+  String page =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Настройка часов</title>"
+    "<style>body{font-family:-apple-system,sans-serif;margin:24px;max-width:420px}"
+    "input,button{width:100%;font-size:18px;padding:12px;margin:8px 0;box-sizing:border-box}"
+    "button{background:#0a84ff;color:#fff;border:0;border-radius:10px}</style></head><body>"
+    "<h2>Настройка Wi-Fi</h2>"
+    "<form method='POST' action='/save'>"
+    "<label>Имя сети</label>"
+    "<input name='ssid' list='nets' autocapitalize='none' autocorrect='off' required>"
+    "<datalist id='nets'>";
+  page += scanOptions;
+  page +=
+    "</datalist>"
+    "<label>Пароль</label>"
+    "<input name='pass' type='password' autocapitalize='none' autocorrect='off'>"
+    "<button type='submit'>Сохранить</button>"
+    "</form></body></html>";
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+// Сохранение имени сети и пароля, затем перезагрузка
+void handleSave() {
+  String newSsid = server.arg("ssid");
+  String newPass = server.arg("pass");
+
+  if (newSsid.length() == 0) {
+    server.send(400, "text/plain; charset=utf-8", "Имя сети не указано");
+    return;
+  }
+
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", newSsid);
+  prefs.putString("pass", newPass);
+  prefs.end();
+
+  server.send(200, "text/html; charset=utf-8",
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+    "<body style='font-family:-apple-system,sans-serif;margin:24px'>"
+    "<h2>Сохранено</h2>"
+    "<p>Часы перезагружаются и подключаются к сети. Это займёт около 20 секунд.</p>"
+    "</body></html>");
+
+  delay(1500);
+  ESP.restart();
+}
+
+// Запуск режима настройки: своя Wi-Fi сеть и веб-страница
+void startPortal() {
+  portalMode = true;
+  portalStart = millis();
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
+
+  // Список доступных сетей для подсказки в форме
+  int n = WiFi.scanNetworks();
+  scanOptions = "";
+  for (int i = 0; i < n; i++) {
+    scanOptions += "<option value=\"" + htmlEscape(WiFi.SSID(i)) + "\">";
+  }
+  WiFi.scanDelete();
+
+  WiFi.softAP(AP_NAME, AP_PASS);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleRoot);
+  server.begin();
+
+  // Индикация режима настройки: фиолетовая точка на позиции 00:00:00
+  strip.setBrightness(40);
+  strip.clear();
+  strip.setPixelColor(LED_OFFSET % NUM_LEDS, strip.Color(255, 0, 255));
+  strip.show();
+
+  Serial.println("Setup mode started.");
+  Serial.print("Wi-Fi network: ");
+  Serial.println(AP_NAME);
+  Serial.print("Open in Safari: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+// Подключение к домашней сети с ограничением по времени
+bool connectToWiFi(const String& s, const String& p, unsigned long timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(s.c_str(), p.c_str());
+
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Принудительно выключаем встроенный светодиод платы
+  pinMode(INTERNAL_LED, OUTPUT);
+  digitalWrite(INTERNAL_LED, HIGH);
+
+  // Стабилизация пина управления лентой
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  delay(10);
+
+  // Старт работы с адресными светодиодами
+  strip.begin();
+  strip.setBrightness(255);
+  strip.show();
+
+  // Читаем сохранённые данные сети
+  prefs.begin("wifi", false);
+  String savedSsid = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  prefs.end();
+  hasSavedCreds = (savedSsid.length() > 0);
+
+  bool connected = false;
+  if (hasSavedCreds) {
+    connected = connectToWiFi(savedSsid, savedPass, 20000);
+  }
+
+  if (connected) {
+    Serial.println("Wi-Fi Connected!");
+    // Синхронизация времени по протоколу NTP
+    configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov");
+    Serial.println("NTP server synchronized.");
+  } else {
+    startPortal();
+  }
+}
+
+void loop() {
+  // Режим настройки: обслуживаем веб-страницу, часы не показываем
+  if (portalMode) {
+    server.handleClient();
+    // Если данные сети были сохранены ранее (например, роутер был выключен),
+    // через 5 минут перезагружаемся и пробуем подключиться снова
+    if (hasSavedCreds && millis() - portalStart > 300000UL) {
+      Serial.println("Setup timeout, restarting...");
+      ESP.restart();
+    }
+    delay(2);
+    return;
+  }
+
+  struct tm timeinfo;
+  // Если время еще не подтянулось из сети, ждем стабильного подключения
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Waiting for time server response...");
+    delay(1000);
+    return;
+  }
+
+  // Получаем текущие данные времени
+  int currentHour = timeinfo.tm_hour;
+  int currentMinute = timeinfo.tm_min;
+  int currentSecond = timeinfo.tm_sec;
+
+  // Флаг ночного режима: с 21:00 до 07:00 (не включая 07:00)
+  bool isNight = (currentHour >= 21 || currentHour < 7);
+
+  // Динамически управляем яркостью всей ленты
+  if (isNight) {
+    strip.setBrightness(25);  // ~10% от максимальной яркости 255
+  } else {
+    strip.setBrightness(255); // 100% яркости
+  }
+
+  // Рассчитываем базовые виртуальные позиции стрелок (0-59)
+  int raw_s = currentSecond;
+  int raw_m = currentMinute;
+  int raw_h = ((currentHour % 12) * 5) + (currentMinute / 12); // Плавное смещение часовой стрелки
+
+  // Применяем круговой сдвиг под физическое положение начала круга корпуса (28-й светодиод)
+  int s_pixel = (raw_s + LED_OFFSET) % NUM_LEDS;
+  int m_pixel = (raw_m + LED_OFFSET) % NUM_LEDS;
+  int h_pixel = (raw_h + LED_OFFSET) % NUM_LEDS;
+
+  // Полностью очищаем предыдущий шаг отображения
+  strip.clear();
+
+  // Логика побитового наложения и смешивания цветов при совпадении стрелок
+  // Шаг 1: Красный цвет для часа (работает всегда)
+  uint32_t color = strip.getPixelColor(h_pixel);
+  strip.setPixelColor(h_pixel, color | strip.Color(255, 0, 0));
+
+  // Шаг 2: Зеленый цвет для минут (работает всегда)
+  color = strip.getPixelColor(m_pixel);
+  strip.setPixelColor(m_pixel, color | strip.Color(0, 255, 0));
+
+  // Шаг 3: Синий цвет для секунд (ТОЛЬКО ДНЕМ)
+  if (!isNight) {
+    color = strip.getPixelColor(s_pixel);
+    strip.setPixelColor(s_pixel, color | strip.Color(0, 0, 255));
+  }
+
+  // Передаем обновленный массив цветов на светодиоды
+  strip.show();
+
+  // Отправка текущих логов в Монитор порта
+  Serial.printf("Time: %02d:%02d:%02d | Mode: %s | Brightness: %d%%\n",
+                currentHour, currentMinute, currentSecond,
+                isNight ? "NIGHT" : "DAY",
+                isNight ? 10 : 100);
+
+  // Тактовая частота обновления основного цикла программы (150 мс)
+  delay(150);
+}
